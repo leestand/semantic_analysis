@@ -1,0 +1,398 @@
+### 중앙일보 기사를 스크롤링해서 백터 디비에 저장하는 함수들 생성
+
+import urllib.request
+from bs4 import BeautifulSoup
+import json
+import time
+import uuid
+from datetime import datetime
+
+def ja_detail_url(keyword, num):
+    text1 = urllib.parse.quote(keyword)
+    params = []
+    for i in range(1, num+1):
+        list_url = "https://www.joongang.co.kr/search/news?keyword=" + text1 + "&page=" + str(i)
+        url = urllib.request.Request(list_url)  # 웹서버로 요청을 보낼 수 있는 상태
+        f = urllib.request.urlopen(url).read().decode("utf-8")  # URL로부터 데이터 가져옴
+        soup = BeautifulSoup(f, "html.parser")
+        for i in soup.select("div.card_body > h2.headline > a"):
+            params.append(i.get("href"))
+    return params
+
+def ja(keyword, num):
+    result = ja_detail_url(keyword, num)
+    articles = []
+    
+    # 현재 시간을 ISO 형식으로 저장
+    current_time = datetime.now().isoformat()
+    
+    for i in result:
+        article_data = {}
+        article_data["id"] = str(uuid.uuid4())  # 고유 ID 생성
+        article_data["url"] = i
+        article_data["keyword"] = keyword
+        article_data["collected_at"] = current_time  # 크롤링 시간 추가
+        # 날짜 초기값 설정 (반드시 키는 존재하도록)
+        article_data["date"] = "날짜 정보 없음"
+        
+        try:
+            url = urllib.request.Request(i)
+            f = urllib.request.urlopen(url).read().decode('utf-8')
+            soup = BeautifulSoup(f, 'html.parser')
+            
+            # 제목 추출
+            title_element = soup.select_one("h1.headline")
+            if title_element:
+                article_data["title"] = title_element.text.strip()
+            else:
+                article_data["title"] = "제목 없음"
+            
+            # 날짜 추출 - 명확하게 처리
+            date_element = soup.select_one("time")
+            if date_element and date_element.has_attr('datetime'):
+                article_data["date"] = date_element['datetime']
+            else:
+                # 다른 날짜 선택자 시도
+                date_element = soup.select_one("div.byline > em")
+                if date_element:
+                    article_data["date"] = date_element.text.strip()
+            
+            # 본문 추출
+            content = []
+            for i2 in soup.select('article.article > div p'):
+                content.append(i2.text.strip())
+            
+            article_data["content"] = "\n".join(content)
+            articles.append(article_data)
+            
+            print(f"기사 추출 완료: {article_data['title']}, 날짜: {article_data['date']}")
+            time.sleep(0.5)  # 서버 부하 방지
+            
+        except Exception as e:
+            print(f"오류 발생: {e}")
+            # 오류가 발생해도 date 키는 이미 초기화했으므로 존재함
+    
+    # JSON 파일로 저장
+    output_file = f"joongang_{keyword}.json"
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(articles, f, ensure_ascii=False, indent=2)
+    
+    print(f"총 {len(articles)}개 기사를 {output_file}에 저장했습니다.")
+    return articles
+
+
+ja('엔시티 NCT 팬덤', 5) 
+
+
+
+!pip install chromadb
+
+import chromadb  # 벡터 데이터베이스 모듈.
+from chromadb.utils import embedding_functions  # 임베딩 함수
+
+# 백터 디비 초기화 및 json 파일 로딩하는 함수 생성 
+def build_vector_database(json_file, collection=None):
+
+    # json 파일을 로드 
+    with open(json_file, 'r', encoding='utf-8') as f:  # blog_data.json 파일을 읽기 모드로 엽니다.
+        blog_data = json.load(f) # blog_data.json 파일을 불러옵니다.
+
+    # 컬렉션 이름이 없으면 간단한 영문 이름 생성 
+    #if not collection_name:
+    keyword_safe = "nct" # 컬렉션 이름이 없으면 nct로 지정합니다.
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S') # 현재 날짜와 시간을 가져옵니다.
+    collection_name = f'{keyword_safe}_{timestamp}' # realstate_날짜_시간 형식으로 컬렉션 이름을 만듭니다.
+
+    print(f'사용할 컬랙션 이름, {collection_name}')
+
+    # 기본 임베딩 함수를 사용 
+    basic_ef = embedding_functions.DefaultEmbeddingFunction() # 기본 임베딩 함수를 사용합니다.
+
+    # ChromaDB 클라이언트를 초기화합니다.
+    chroma_client = chromadb.PersistentClient(path="./chroma_db") # choma_db 폴더에 데이터를 저장합니다.
+
+    # 컬렉션 생성(기존에 같은 이름의 컬렉션이 존재하면 삭제후 재생성 )
+    try:
+        chroma_client.delete_collection(collection_name) # 컬렉션을 삭제합니다.
+    except:
+        pass 
+
+    # 컬렉션 생성
+    collection = chroma_client.create_collection(
+        name = collection_name, # 컬렉션 이름
+        embedding_function = basic_ef, # 임베딩 함수
+        metadata ={"descrtion" : "NCT 관련 블러그 데이터"} # 메타데이터
+    )
+
+    # 컬렉션에 데이터 저장 
+    ids = []
+    documents = []
+    metadatas = [] 
+
+    for item in blog_data:
+
+        # 글의 전체 내용( 제목 + 내용 )
+        full_content = item['title'] + " " + item['content'] # 제목과 내용을 합칩니다.
+
+        ids.append(item['id'])  #   id를 추가합니다.
+        documents.append(full_content) # 본문을 추가합니다.
+
+        # 메타 데이터를 구성 
+        metadata = { 
+            "url" : item['url'],
+            "date" : item['date'],
+            "title" : item['title'],
+            "keyword" : item['keyword'],
+            "collected_at" : item['collected_at']
+                }
+        
+        if 'member' in item:
+            metadata['member'] = item['member']
+        if 'activity_type' in item:
+            metadata['activity_type'] = item['activity_type'] 
+    
+        metadatas.append(metadata) # 메타데이터를 추가합니다. 
+
+        # 백터 db 에 데이터 추가 
+        if ids:
+            collection.add(
+                ids= ids,
+                documents = documents,
+                metadatas= metadatas
+            )
+
+    return collection
+
+
+!chcp 65001
+!dir
+
+
+build_vector_database("./joongang_엔시티 NCT 팬덤.json")
+
+
+def search_articles(collection_name, query, filters=None, n_results=5):
+    #query ="NCT 마크의 최신 활동에 대해 알려주세요"
+
+    #filters = {"member" : "마크"}
+    #filters= None
+
+    query_params = { 
+        "query_texts" : [query],
+        "n_results" : n_results
+    }
+
+    # 필터 추가(있는 경우)
+    if filters:
+        query_params['where'] = filters 
+
+    # 크로마 클라이언트 초기화
+    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+
+    # 컬렉션 가져오기
+    collection = chroma_client.get_collection(name=collection_name)
+
+    # 검색 수행 
+    results = collection.query(**query_params)
+
+    # 검색 결과 포멧팅
+    formatted_results = []
+
+    # 질문과 유사도가 높은 내용을 출력 
+    if results and 'documents' in results and results['documents']:
+        documents = results['documents'][0]
+        metadatas = results['metadatas'][0]
+        distances = results['distances'][0] if 'distances' in results else None 
+        for i in range(len(documents)):
+            # 유사도 점수 계산(거리에서 변환)
+            similarity_score = 1 - min(distances[i], 1.0) if distances else None  # 거리가 작을 수록 유사도가 높음
+            
+            # 미리보기 생성(내용 일부)
+            preview = documents[i].replace('\n',' ')[:300] + "..."
+            
+            # 결과 아이템 구성 
+            result_item = { 
+                "title" : metadatas[i].get('title','제목 없음'),
+                "date" : metadatas[i].get('date','날짜 없음'),
+                'url' : metadatas[i].get('url',''),
+                'member' : metadatas[i].get('member','멤버 정보 없음'),
+                'content_type' : metadatas[i].get('content_type','컨텐츠 유형 정보 없음'),
+                'content' : documents[i],
+                'preview' : preview,
+                'similarity' : similarity_score     
+            }
+
+            formatted_results.append(result_item)
+
+            # 결과 출력 
+            print(f"\n--- 결과 {i+1} ---")
+            print(f"제목: {result_item['title']}")
+            print(f"날짜: {result_item['date']}")
+            print(f"멤버: {result_item['member']}")
+            print(f"컨텐츠 유형: {result_item['content_type']}")
+            if similarity_score:
+                print(f"유사도: {similarity_score:.4f}")
+            print(f"URL: {result_item['url']}")
+            print(f"미리보기: {preview}")
+        
+        return formatted_results
+
+
+
+# 컬랙션 이름 확인
+# 백터 디비에 있는 컬랙션 이름을 조회 
+
+# Chroma DB 에 저장되어 있는 collection 리스트를 확인하는 코드 
+
+import chromadb  # 벡터 데이터베이스 모듈.
+
+# ChromaDB 클라이언트를 초기화합니다. 
+chroma_client = chromadb.PersistentClient(path="./chroma_db")  # choma_db 폴더에 데이터를 저장합니다.
+
+# collection 리스트를 가져옵니다.
+collection_names = chroma_client.list_collections() 
+
+for i  in  collection_names:
+    print(i)
+
+
+
+# 시멘틱 검색을 하는 search_articles 함수를 실행합니다.
+collection_name = "nct_20250326_114354"
+#collection = chroma_client.get_collection(name=collection_name) # 컬렉션을 가져옵니다.
+
+# 검색 함수 호출
+search_results = search_articles(collection_name, "엔시티 nct 팬덤문화", n_results=5)
+
+# 시멘틱 검색을 하는 search_articles 함수를 실행합니다.
+collection_name = "nct_20250326_114354"
+#collection = chroma_client.get_collection(name=collection_name) # 컬렉션을 가져옵니다.
+
+# 검색 함수 호출
+search_results = search_articles(collection_name, "엔시티 nct 팬덤문화", n_results=5)
+
+# chatGPT API 를 이용한 분석 함수 생성 
+
+from  openai  import  OpenAI 
+
+def analyze_with_gpt(query, search_results, api_key, model="gpt-4o-mini"):
+    #query = "엔시티 nct 팬덤문화"
+
+    if not api_key or api_key == "":
+        print( "Open AI API 가 유효하지 않습니다. 유효한 API 키를 입력하세요" )
+
+    client = OpenAI(api_key=api_key) # OpenAI 클라이언트 초기화
+
+    # GPT 에게 전달할 컨텍스트를 구성(짧게 조정)
+    context ="다음은 네이버 블로그에서 검색한 엔시티(NCT) 관련 문서들입니다.: \n\n" 
+    for i, result in enumerate(search_results[:3]): # 상위 3개의 결과만 사용 
+        context += f"문서 {i+1}: \n"
+        context += f"제목: {result['title']} \n"
+
+        # 메타 데이터 추가 
+        if 'date' in result:
+            context += f"작성일: {result['date']} \n"
+        if 'author' in result:
+            context += f"작성자: {result['author']} \n" 
+        if 'group' in result: 
+            context += f"그룹: {result['group']} \n" 
+
+        context_preview = result['content'][:800] if 'content' in result else result.get('preview','')[:800]
+        context += f"내용 요약: {context_preview}...\n\n"  
+        
+    #GPT 프롬프트 생성
+    system_prompt = """당신은 K-pop 그룹 NCT(엔시티)와 그 팬덤 문화에 대한 전문가입니다. 엔시티의 다양한 유닛과 멤버, 팬덤 문화의 특징과 트렌드를 정확하게 파악하는 능력이 뛰어납니다. 
+    제공된 문서들을 바탕으로 특히 'NCT 팬덤 문화의 특징과 현상'에 초점을 맞추어 분석해 주세요.
+
+    답변 작성 가이드라인:
+    1. 문서에서 NCT 팬덤 문화의 특징적인 현상과 배경을 먼저 찾아 강조해 주세요.
+    2. 유닛별(NCT 127, NCT DREAM, WayV, NCT WISH 등) 팬덤 특성과 차이점을 설명해 주세요.
+    3. 팬덤 활동(팬미팅, 음원 스트리밍, SNS 활동 등)의 특징과 영향력을 구체적으로 분석해 주세요.
+    4. 문서에 언급된 구체적인 데이터나 사례를 활용해 주세요.
+    5. NCT 팬덤 문화의 최근 트렌드와 앞으로의 전망에 대한 내용도 포함해 주세요.
+    6. 사용자의 질문에 직접적으로 관련된, NCT 팬덤 문화에 집중하세요."""
+
+    user_prompt = f"""{context}
+
+    사용자 질문: {query}
+
+    위 문서들을 분석하여 'NCT 팬덤 문화의 특징과 현상'에 초점을 맞춘 전문적인 답변을 제공해주세요.
+    특히 문서 1에 집중하여 팬덤 문화의 주요 특징과 배경을 자세히 설명해주세요.
+    다른 문서에서도 팬덤 문화와 관련된 내용이 있다면 함께 분석해주세요.
+
+    답변에는 다음 내용을 반드시 포함해주세요:
+    1. NCT 팬덤 문화의 구체적인 특징(최소 3가지 이상)
+    2. 유닛별 팬덤 특성과 차이점
+    3. 팬덤 활동의 다양한 형태와 영향력
+    4. 문서에 언급된 구체적인 사례나 데이터
+
+    각 특징과 요소를 별도 단락으로 구분하고, 중요한 정보는 강조해서 표시해주세요."""
+
+    # ChatGPT API 호출 
+
+    response = client.chat.completions.create( 
+        model = 'gpt-4o-mini', # 사용할 GPT 모델
+        messages=[ 
+            {"role" : "system", "content" : system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature = 0.5,  # temperature 값은 0.1 ~1.0 사이로 주는데 클수록 다양한 답변이 나옵니다.
+                        # 적을 수록 더 확실한 답변이 나옵니다.
+        max_tokens = 1000  # 생성할 최대 토큰 수
+    )
+
+    # 응답 추출 
+    analysis = response.choices[0].message.content.strip()
+
+    #출력 형식 지정
+    print("\n" + "="*60)
+    print(" "*20 + "NCT 팬덤 문화 분석 결과")
+    print("="*60 + "\n")
+
+    # 줄바꿈 처리를 확실히 하기 위해 각 단락마다 빈 줄을 추가 
+    formatted_analysis = analysis.replace("\n\n", "\n\n")
+    print(formatted_analysis) 
+
+    print("/n" + "="*60 + "/n")
+
+    return analysis
+
+
+# 시멘틱 검색을 하는 search_articles 함수를 실행합니다.
+collection_name = "nct_20250326_114354"  # 목록에 있던 정확한 이름으로 변경
+#collection = chroma_client.get_collection(name=collection_name) # 컬렉션을 가져옵니다.
+
+!pip install python-dotenv
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+api_key = os.getenv("OPENAI_API_KEY")
+search_results = search_articles(collection_name, "엔시티 팬덤 문화", n_results=1)
+response = analyze_with_gpt("엔시티 팬덤 문화", search_results, api_key)
+
+
+
+
+# 응답 결과를 예쁘게 출력하는 함수 
+
+def display_formatted_response(response_text):
+    from IPython.display import display, Markdown
+
+    # 단락 구분을 명확히
+    formatted_text = response_text.replace("\n", "\n\n")
+
+    print("/n" + "="*60) 
+    print(" "*20 + "NCT 팬덤 문화 분석 결과")
+    print("="*60 + "/n")
+
+    # Markdown 으로 출력하여 형식을 유지 
+    display(Markdown(formatted_text))
+    print("/n" + "="*60 + "/n")
+
+display_formatted_response(response)
+
+
+
